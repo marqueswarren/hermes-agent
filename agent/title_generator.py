@@ -58,7 +58,8 @@ def generate_title(
             task="title_generation",
             messages=messages,
             max_tokens=500,
-            temperature=0.3,
+            # No temperature: Opus 4.7+ / Sonnet 5 reject any value with a 400
+            # ("`temperature` is deprecated for this model").
             timeout=timeout,
             main_runtime=main_runtime,
         )

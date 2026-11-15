@@ -6733,8 +6733,14 @@ class AIAgent:
                 or []
             )
             for conn in list(connections):
+                # httpcore>=1.0 wraps the protocol connection
+                # (HTTP11Connection / HTTP2Connection) in an HTTPConnection;
+                # the network stream lives on the inner ``_connection``.
+                inner = getattr(conn, "_connection", None) or conn
                 stream = (
-                    getattr(conn, "_network_stream", None)
+                    getattr(inner, "_network_stream", None)
+                    or getattr(inner, "_stream", None)
+                    or getattr(conn, "_network_stream", None)
                     or getattr(conn, "_stream", None)
                 )
                 if stream is None:
@@ -6784,6 +6790,12 @@ class AIAgent:
             )
 
     def _replace_primary_openai_client(self, *, reason: str) -> bool:
+        # On the Anthropic Messages path the primary client is
+        # ``self._anthropic_client``; ``self._client_kwargs`` is empty, so
+        # building an OpenAI client here always failed with "api_key client
+        # option must be set" and stale-stream recovery silently did nothing.
+        if getattr(self, "api_mode", None) == "anthropic_messages":
+            return self._replace_primary_anthropic_client(reason=reason)
         with self._openai_client_lock():
             old_client = getattr(self, "client", None)
             try:
@@ -6798,6 +6810,40 @@ class AIAgent:
                 return False
             self.client = new_client
         self._close_openai_client(old_client, reason=f"replace:{reason}", shared=True)
+        return True
+
+    def _replace_primary_anthropic_client(self, *, reason: str) -> bool:
+        """Abort any in-flight request on the Anthropic client and rebuild it.
+
+        ``anthropic.Anthropic.close()`` does NOT interrupt a streaming read
+        blocked in another thread (verified against anthropic 0.86 / httpcore
+        1.0.9), so force-shutdown the pooled TCP sockets first.  The blocked
+        ``messages.stream()`` iterator then raises ``httpx.RemoteProtocolError``
+        and the streaming retry loop reconnects on the rebuilt client.
+        """
+        old_client = getattr(self, "_anthropic_client", None)
+        force_closed = self._force_close_tcp_sockets(old_client) if old_client is not None else 0
+        try:
+            if old_client is not None:
+                old_client.close()
+        except Exception:
+            pass
+        try:
+            self._rebuild_anthropic_client()
+        except Exception as exc:
+            logger.warning(
+                "Failed to rebuild Anthropic client (%s) %s error=%s",
+                reason,
+                self._client_log_context(),
+                exc,
+            )
+            return False
+        logger.info(
+            "Anthropic client rebuilt (%s, tcp_force_closed=%d) %s",
+            reason,
+            force_closed,
+            self._client_log_context(),
+        )
         return True
 
     def _ensure_primary_openai_client(self, *, reason: str) -> Any:
@@ -7522,6 +7568,21 @@ class AIAgent:
             self._try_refresh_anthropic_client_credentials()
         return self._anthropic_client.messages.create(**api_kwargs)
 
+    @staticmethod
+    def _estimate_api_kwargs_tokens(api_kwargs: dict) -> int:
+        """Rough token estimate for a request payload, any api_mode.
+
+        The Anthropic path carries the system prompt in ``system`` (not in
+        ``messages``) and tool schemas in ``tools``; counting only
+        ``messages`` under-reported a ~31K-token first call as ~438.
+        """
+        total = sum(len(str(v)) for v in api_kwargs.get("messages", []) or [])
+        for key in ("system", "tools", "instructions", "input"):
+            val = api_kwargs.get(key)
+            if val:
+                total += len(str(val))
+        return total // 4
+
     def _rebuild_anthropic_client(self) -> None:
         """Rebuild the Anthropic client after an interrupt or stale call.
 
@@ -7647,7 +7708,7 @@ class AIAgent:
             # arrives within the configured timeout.
             _elapsed = time.time() - _call_start
             if _elapsed > _stale_timeout:
-                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+                _est_ctx = self._estimate_api_kwargs_tokens(api_kwargs)
                 logger.warning(
                     "Non-streaming API call stale for %.0fs (threshold %.0fs). "
                     "model=%s context=~%s tokens. Killing connection.",
@@ -8374,7 +8435,7 @@ class AIAgent:
                             e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                         )
                         _is_conn_err = isinstance(
-                            e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
+                            e, (_httpx.ConnectError, _httpx.RemoteProtocolError, _httpx.ReadError, ConnectionError)
                         )
 
                         # If the stream died AFTER some tokens were delivered:
@@ -8610,7 +8671,7 @@ class AIAgent:
             # when the context is large.  Without this, the stale detector kills
             # healthy connections during the model's thinking phase, producing
             # spurious RemoteProtocolError ("peer closed connection").
-            _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+            _est_tokens = self._estimate_api_kwargs_tokens(api_kwargs)
             if _est_tokens > 100_000:
                 _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
             elif _est_tokens > 50_000:
@@ -8646,7 +8707,7 @@ class AIAgent:
             # inner retry loop can start a fresh connection.
             _stale_elapsed = time.time() - last_chunk_time["t"]
             if _stale_elapsed > _stream_stale_timeout:
-                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+                _est_ctx = self._estimate_api_kwargs_tokens(api_kwargs)
                 logger.warning(
                     "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
                     "model=%s context=~%s tokens. Killing connection.",

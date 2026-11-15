@@ -83,7 +83,7 @@ _ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7")
 
 # Models where temperature/top_p/top_k return 400 if set to non-default values.
 # This is the Opus 4.7 contract; future 4.x+ models are expected to follow it.
-_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7")
+_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8", "sonnet-5", "opus-5")
 _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 
 # ── Max output token limits per Anthropic model ───────────────────────
